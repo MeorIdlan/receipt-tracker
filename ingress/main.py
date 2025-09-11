@@ -11,6 +11,8 @@ from google.cloud import pubsub_v1
 PROJECT_ID = os.getenv("PROJECT_ID") or os.getenv("GCP_PROJECT")
 TOPIC_ID = os.getenv("PUBSUB_TOPIC_ID", "receipts.new")
 API_KEY = os.getenv("API_KEY")  # Inject from Secret Manager at deploy time
+if API_KEY:
+    API_KEY = API_KEY.strip()
 
 # Pub/Sub client at module import (reused across invocations for speed)
 publisher = pubsub_v1.PublisherClient()
@@ -51,6 +53,9 @@ def ingress(request: Request):
 
     # Shared-secret check
     incoming_key = request.headers.get("X-API-Key")
+    if incoming_key:
+        incoming_key = incoming_key.strip()
+    
     if not API_KEY or incoming_key != API_KEY:
         return _bad_request("Unauthorized", 401)
 

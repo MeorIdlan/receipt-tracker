@@ -276,13 +276,13 @@ def validator(event, context):
         "month_key": month_key,
         "header": HEADER,
         "norm": norm,
-        "notes": notes
+        "notes": notes,
+        "rows": rows
     }
 
     if needs_review:
-        _pub(topic_review, {**out_common, "reason": "needs_review"}, fileId=file_id or "", status="review")
-        logging.info("validator: sent to review fileId=%s notes=%s", file_id, notes)
-        return
-
-    _pub(topic_valid, {**out_common, "rows": rows}, fileId=file_id or "", status="valid")
-    logging.info("validator: ok fileId=%s rows=%d", file_id, len(rows))
+        out_review = {**out_common, "status": "NEEDS REVIEW", "reason": "needs_review"}
+        _pub(topic_review, out_review, fileId=file_id or "", status="review")
+    else:
+        out_valid  = {**out_common, "status": "OK"}
+        _pub(topic_valid, out_valid, fileId=file_id or "", status="valid")

@@ -21,6 +21,8 @@ EXPECTED_BASE_HEADER = [
 EXTRA_COLS = ["status","notes","file_link"]
 EXPECTED_HEADER = EXPECTED_BASE_HEADER + EXTRA_COLS
 
+FOOTER_LABEL = "MONTH TOTAL"
+
 # Auth with Sheets scope
 creds, _ = google.auth.default(scopes=[
     "https://www.googleapis.com/auth/spreadsheets",
@@ -137,6 +139,12 @@ def _ensure_header_and_format(spreadsheet_id: str, title: str, sheet_id: int, fr
 
     if reqs:
         sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": reqs}).execute()
+        
+    # Add data validation rule for status column
+    _add_status_dropdown(spreadsheet_id, sheet_id, status_col_idx)
+    
+    # protect header row (warning-only)
+    _ensure_header_protection(spreadsheet_id, sheet_id, width=len(EXPECTED_HEADER))
 
 def _append_rows(spreadsheet_id: str, title: str, rows: list[list[Any]]):
     sheets.spreadsheets().values().append(
@@ -145,6 +153,148 @@ def _append_rows(spreadsheet_id: str, title: str, rows: list[list[Any]]):
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": rows}
+    ).execute()
+
+def _get_last_used_row(spreadsheet_id: str, title: str) -> int:
+    vr = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=f"{title}!A:A"
+    ).execute()
+    values = vr.get("values", [])
+    return len(values)  # 1-based; 1 means header only
+
+def _delete_row(spreadsheet_id: str, sheet_id: int, row_1_based: int):
+    req = {
+        "deleteDimension": {
+            "range": {"sheetId": sheet_id, "dimension": "ROWS",
+                      "startIndex": row_1_based - 1, "endIndex": row_1_based}
+        }
+    }
+    sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests":[req]}).execute()
+
+def _format_footer_row(spreadsheet_id: str, sheet_id: int, row_1_based: int, num_cols: int):
+    req = {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": row_1_based - 1,
+                "endRowIndex": row_1_based,
+                "startColumnIndex": 0,
+                "endColumnIndex": num_cols
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "textFormat": {"bold": True},
+                    "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95}
+                }
+            },
+            "fields": "userEnteredFormat(textFormat,backgroundColor)"
+        }
+    }
+    sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests":[req]}).execute()
+
+def _upsert_month_footer(spreadsheet_id: str, title: str, sheet_id: int, header: list):
+    # 1) If the last row is an existing footer, delete it
+    last = _get_last_used_row(spreadsheet_id, title)
+    if last >= 2:
+        check = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{title}!A{last}:A{last}"
+        ).execute().get("values", [[]])
+        if check and check[0] and str(check[0][0]).strip().upper() == FOOTER_LABEL:
+            _delete_row(spreadsheet_id, sheet_id, last)
+            last -= 1
+
+    # 2) Append fresh footer row
+    # Build a blank row with the same width as header; label col A, formula in col 'total'
+    width = len(header)
+    row = [""] * width
+    row[0] = FOOTER_LABEL
+    total_col_idx = header.index("total")  # 0-based
+    row[total_col_idx] = "=IFERROR(SUM(QUERY(UNIQUE(FILTER({M2:M, I2:I}, N2:N<>\"NEEDS REVIEW\")), \"select sum(Col2) where Col1 <> ''\", 0)), 0)"
+
+    # Status/notes/file_link remain blank on the footer row
+    sheets.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{title}!A1",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [row]}
+    ).execute()
+
+    # 3) Make the new last row bold & shaded
+    new_last = _get_last_used_row(spreadsheet_id, title)
+    _format_footer_row(spreadsheet_id, sheet_id, new_last, width)
+    
+def _add_status_dropdown(spreadsheet_id: str, sheet_id: int, status_col_idx: int):
+    req = {
+        "setDataValidation": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,  # from row 2 down
+                "startColumnIndex": status_col_idx,
+                "endColumnIndex": status_col_idx + 1
+            },
+            "rule": {
+                "condition": {
+                    "type": "ONE_OF_LIST",
+                    "values": [
+                        {"userEnteredValue": "OK"},
+                        {"userEnteredValue": "NEEDS REVIEW"}
+                    ]
+                },
+                "strict": True,
+                "inputMessage": "Choose OK or NEEDS REVIEW"
+            }
+        }
+    }
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": [req]}
+    ).execute()
+
+def _ensure_header_protection(spreadsheet_id: str, sheet_id: int, width: int):
+    """
+    Protect row 1 (warning only). Idempotent: skips if an equivalent protection exists.
+    """
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId),protectedRanges)"
+    ).execute()
+
+    # Find current sheet's protections
+    pranges = []
+    for s in meta.get("sheets", []):
+        if s.get("properties", {}).get("sheetId") == sheet_id:
+            pranges = s.get("protectedRanges", []) or []
+            break
+
+    # See if a warningOnly protection for row 1 already exists
+    for pr in pranges:
+        rng = pr.get("range", {})
+        if (pr.get("warningOnly") is True and
+            rng.get("sheetId") == sheet_id and
+            rng.get("startRowIndex") == 0 and rng.get("endRowIndex") == 1 and
+            (rng.get("startColumnIndex", 0) == 0) and
+            (rng.get("endColumnIndex") in (None, width))):
+            return  # already protected
+
+    # Add protection for A1:… (first row, through current header width)
+    req = {
+        "addProtectedRange": {
+            "protectedRange": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": width
+                },
+                "warningOnly": True,
+                "description": "Header row protected (warning only)."
+            }
+        }
+    }
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [req]}
     ).execute()
 
 # -------- Entrypoint --------
@@ -187,3 +337,5 @@ def sheets_writer(event, context):
 
     _append_rows(SPREADSHEET_ID, month_key, augmented)
     logging.info("sheets_writer: appended %d row(s) to %s (status=%s)", len(augmented), month_key, status)
+    
+    _upsert_month_footer(SPREADSHEET_ID, month_key, sheet_id, EXPECTED_HEADER)

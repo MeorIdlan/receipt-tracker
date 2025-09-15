@@ -16,5 +16,4 @@ gcloud functions deploy sheets_writer_valid \
         --entry-point=sheets_writer \
         --trigger-topic=receipts.review \
         --service-account="$SA" \
-        --env-vars-file .env.sheets_writer.yaml \
-        --set-env-vars="DEFAULT_STATUS=NEEDS REVIEW"
+        --env-vars-file .env.sheets_writer.yaml

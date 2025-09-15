@@ -3,6 +3,8 @@ import json
 import logging
 import os
 from typing import Any
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import google.auth
 from googleapiclient.discovery import build
@@ -21,7 +23,24 @@ EXPECTED_BASE_HEADER = [
 EXTRA_COLS = ["status","notes","file_link"]
 EXPECTED_HEADER = EXPECTED_BASE_HEADER + EXTRA_COLS
 
-FOOTER_LABEL = "MONTH TOTAL"
+TOTALS_SHEET_NAME = "MONTHLY TOTAL"
+TOTALS_HEADER = [
+    "month",                # e.g., 2025-09
+    "receipts_ok",          # unique receipts (OK)
+    "receipts_all",         # unique receipts (all)
+    "qty_ok",               # sum of qty (OK rows)
+    "qty_all",              # sum of qty (all rows)
+    "total_ok",             # sum of unique receipt totals (OK)
+    "total_all",            # sum of unique receipt totals (all)
+    "avg_per_receipt_ok",   # total_ok / receipts_ok
+    "avg_per_day_ok",       # total_ok / distinct purchase days (OK)
+    "reviewed_count",       # receipts flagged NEEDS REVIEW
+    "reviewed_pct",         # reviewed_count / receipts_all
+    "distinct_days_ok",     # number of purchase days counted in avg
+    "last_updated"          # ISO timestamp
+]
+
+TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kuala_Lumpur"))
 
 # Auth with Sheets scope
 creds, _ = google.auth.default(scopes=[
@@ -154,75 +173,6 @@ def _append_rows(spreadsheet_id: str, title: str, rows: list[list[Any]]):
         insertDataOption="INSERT_ROWS",
         body={"values": rows}
     ).execute()
-
-def _get_last_used_row(spreadsheet_id: str, title: str) -> int:
-    vr = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id, range=f"{title}!A:A"
-    ).execute()
-    values = vr.get("values", [])
-    return len(values)  # 1-based; 1 means header only
-
-def _delete_row(spreadsheet_id: str, sheet_id: int, row_1_based: int):
-    req = {
-        "deleteDimension": {
-            "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                      "startIndex": row_1_based - 1, "endIndex": row_1_based}
-        }
-    }
-    sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests":[req]}).execute()
-
-def _format_footer_row(spreadsheet_id: str, sheet_id: int, row_1_based: int, num_cols: int):
-    req = {
-        "repeatCell": {
-            "range": {
-                "sheetId": sheet_id,
-                "startRowIndex": row_1_based - 1,
-                "endRowIndex": row_1_based,
-                "startColumnIndex": 0,
-                "endColumnIndex": num_cols
-            },
-            "cell": {
-                "userEnteredFormat": {
-                    "textFormat": {"bold": True},
-                    "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95}
-                }
-            },
-            "fields": "userEnteredFormat(textFormat,backgroundColor)"
-        }
-    }
-    sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests":[req]}).execute()
-
-def _upsert_month_footer(spreadsheet_id: str, title: str, sheet_id: int, header: list):
-    # 1) If the last row is an existing footer, delete it
-    last = _get_last_used_row(spreadsheet_id, title)
-    if last >= 2:
-        check = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{title}!A{last}:A{last}"
-        ).execute().get("values", [[]])
-        if check and check[0] and str(check[0][0]).strip().upper() == FOOTER_LABEL:
-            _delete_row(spreadsheet_id, sheet_id, last)
-            last -= 1
-
-    # 2) Append fresh footer row
-    # Build a blank row with the same width as header; label col A, formula in col 'total'
-    width = len(header)
-    row = [""] * width
-    row[0] = FOOTER_LABEL
-    total_col_idx = header.index("total")  # 0-based
-    row[total_col_idx] = "=IFERROR(SUM(QUERY(UNIQUE(FILTER({M2:M, I2:I}, N2:N<>\"NEEDS REVIEW\")), \"select sum(Col2) where Col1 <> ''\", 0)), 0)"
-
-    # Status/notes/file_link remain blank on the footer row
-    sheets.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range=f"{title}!A1",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [row]}
-    ).execute()
-
-    # 3) Make the new last row bold & shaded
-    new_last = _get_last_used_row(spreadsheet_id, title)
-    _format_footer_row(spreadsheet_id, sheet_id, new_last, width)
     
 def _add_status_dropdown(spreadsheet_id: str, sheet_id: int, status_col_idx: int):
     req = {
@@ -296,6 +246,189 @@ def _ensure_header_protection(spreadsheet_id: str, sheet_id: int, width: int):
         spreadsheetId=spreadsheet_id,
         body={"requests": [req]}
     ).execute()
+    
+def _ensure_totals_sheet(spreadsheet_id: str) -> int:
+    """Create 'MONTHLY TOTAL' sheet if missing, set header, freeze row, number formats."""
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    by_title = {s["properties"]["title"]: s for s in meta.get("sheets", [])}
+    if TOTALS_SHEET_NAME in by_title:
+        sheet_id = by_title[TOTALS_SHEET_NAME]["properties"]["sheetId"]
+    else:
+        resp = sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests":[{"addSheet":{"properties":{"title": TOTALS_SHEET_NAME, "gridProperties":{"frozenRowCount":1}}}}]}
+        ).execute()
+        sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+
+    # Ensure header row matches TOTALS_HEADER
+    vr = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=f"{TOTALS_SHEET_NAME}!1:1"
+    ).execute()
+    header = (vr.get("values") or [[]])
+    header = header[0] if header else []
+    if header != TOTALS_HEADER:
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TOTALS_SHEET_NAME}!A1",
+            valueInputOption="USER_ENTERED",
+            body={"values":[TOTALS_HEADER]}
+        ).execute()
+
+    # Freeze header + apply basic number formats (currency & percent)
+    reqs = [
+        {
+            "updateSheetProperties": {
+                "properties": {"sheetId": sheet_id, "gridProperties":{"frozenRowCount":1}},
+                "fields": "gridProperties.frozenRowCount"
+            }
+        },
+        # Percent format for reviewed_pct (column K = index 10)
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex":1, "startColumnIndex":10, "endColumnIndex":11},
+                "cell": {"userEnteredFormat":{"numberFormat":{"type":"PERCENT", "pattern":"0.00%"}}},
+                "fields": "userEnteredFormat.numberFormat"
+            }
+        },
+        # Currency-ish number format for totals (F,G,H) = indices 5,6,7 and also I (avg/day) idx=8
+        {
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex":1, "startColumnIndex":5, "endColumnIndex":9},
+                "cell": {"userEnteredFormat":{"numberFormat":{"type":"NUMBER", "pattern":"0.00"}}},
+                "fields": "userEnteredFormat.numberFormat"
+            }
+        }
+    ]
+    sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": reqs}).execute()
+    return sheet_id
+
+
+def _safe_float(x):
+    try:
+        return float(str(x).replace(",","").strip())
+    except Exception:
+        return None
+
+def _compute_month_metrics(spreadsheet_id: str, month_key: str) -> list:
+    """
+    Reads the month sheet rows and computes metrics:
+    - dedupe by image_hash for receipt-level totals
+    - OK means status != 'NEEDS REVIEW'
+    """
+    # Expect columns A..P (0..15) as per EXPECTED_HEADER (+ status/notes/file_link)
+    rng = f"{month_key}!A2:P"
+    vr = sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+    rows = vr.get("values", [])
+
+    # Indexes based on EXPECTED_HEADER order
+    IDX_DATE = 0
+    IDX_QTY = 3
+    IDX_TOTAL = 8
+    IDX_IMG = 12
+    IDX_STATUS = 13
+
+    receipts = {}  # image_hash -> {"status": "OK"/"NEEDS REVIEW", "total": float, "dates": set()}
+    qty_ok = 0.0
+    qty_all = 0.0
+    days_ok = set()
+
+    for r in rows:
+        # pad row defensively
+        r = (r + [""]*16)[:16]
+        status = (r[IDX_STATUS] or "").strip().upper()
+        img = (r[IDX_IMG] or "").strip()
+        total = _safe_float(r[IDX_TOTAL])
+        qty = _safe_float(r[IDX_QTY]) or 0.0
+        date_str = (r[IDX_DATE] or "").strip()
+
+        # items-level counts
+        qty_all += qty
+        if status != "NEEDS REVIEW":
+            qty_ok += qty
+            if date_str:
+                days_ok.add(date_str)
+
+        # receipt-level map (dedupe by image_hash; fall back key if missing)
+        key = img or f"{r[IDX_DATE]}|{total}"
+        if key not in receipts:
+            receipts[key] = {"status": status or "OK", "total": total or 0.0, "dates": set()}
+        # keep worst status if mixed (shouldn't happen, but be safe)
+        if status == "NEEDS REVIEW":
+            receipts[key]["status"] = "NEEDS REVIEW"
+        if date_str:
+            receipts[key]["dates"].add(date_str)
+        # prefer a non-null total if we encounter one later
+        if total is not None:
+            receipts[key]["total"] = total
+
+    receipts_all = len(receipts)
+    reviewed_count = sum(1 for v in receipts.values() if v["status"] == "NEEDS REVIEW")
+    receipts_ok = receipts_all - reviewed_count
+
+    total_ok = sum(v["total"] for v in receipts.values() if v["status"] != "NEEDS REVIEW")
+    total_all = sum(v["total"] for v in receipts.values())
+
+    avg_per_receipt_ok = (total_ok / receipts_ok) if receipts_ok else 0.0
+    distinct_days_ok = len(days_ok)
+    avg_per_day_ok = (total_ok / distinct_days_ok) if distinct_days_ok else 0.0
+    reviewed_pct = (reviewed_count / receipts_all) if receipts_all else 0.0
+
+    return [
+        month_key,
+        receipts_ok,
+        receipts_all,
+        round(qty_ok, 2),
+        round(qty_all, 2),
+        round(total_ok, 2),
+        round(total_all, 2),
+        round(avg_per_receipt_ok, 2),
+        round(avg_per_day_ok, 2),
+        reviewed_count,
+        reviewed_pct,
+        distinct_days_ok,
+        datetime.now(TZ).isoformat(timespec="seconds")
+    ]
+
+
+def _upsert_month_total_row(spreadsheet_id: str, totals_sheet_id: int, metrics_row: list):
+    """Insert or update the row in MONTHLY TOTAL where column A == month."""
+    month_key = metrics_row[0]
+    # Find existing month row
+    colA = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=f"{TOTALS_SHEET_NAME}!A:A"
+    ).execute().get("values", [])
+    found_row = None
+    for i, vals in enumerate(colA, start=1):
+        if vals and str(vals[0]).strip() == month_key:
+            found_row = i
+            break
+
+    if found_row is None:
+        # Append new
+        sheets.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TOTALS_SHEET_NAME}!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values":[metrics_row]}
+        ).execute()
+    else:
+        # Update in place
+        end_col_letter = _col_letter(len(TOTALS_HEADER)-1)
+        rng = f"{TOTALS_SHEET_NAME}!A{found_row}:{end_col_letter}{found_row}"
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=rng,
+            valueInputOption="USER_ENTERED",
+            body={"values":[metrics_row]}
+        ).execute()
+
+
+def _upsert_monthly_total(spreadsheet_id: str, month_key: str):
+    """Public helper to ensure totals sheet + compute & upsert metrics for month_key."""
+    totals_sheet_id = _ensure_totals_sheet(spreadsheet_id)
+    metrics = _compute_month_metrics(spreadsheet_id, month_key)
+    _upsert_month_total_row(spreadsheet_id, totals_sheet_id, metrics)
 
 # -------- Entrypoint --------
 def sheets_writer(event, context):
@@ -338,4 +471,4 @@ def sheets_writer(event, context):
     _append_rows(SPREADSHEET_ID, month_key, augmented)
     logging.info("sheets_writer: appended %d row(s) to %s (status=%s)", len(augmented), month_key, status)
     
-    _upsert_month_footer(SPREADSHEET_ID, month_key, sheet_id, EXPECTED_HEADER)
+    _upsert_monthly_total(SPREADSHEET_ID, month_key)

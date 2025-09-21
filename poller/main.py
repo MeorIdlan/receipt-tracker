@@ -168,7 +168,6 @@ def drive_poller(request):
     log("INFO", f"Polling folder {FOLDER_ID} since {since_iso}")
 
     files = _list_new_files(FOLDER_ID, since_iso)
-    print(files, flush=True)
     if files:
         published = _publish_new(files, state)
         # watermark = newest createdTime among *all* seen this run

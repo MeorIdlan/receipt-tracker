@@ -2,8 +2,8 @@ import base64
 import hashlib
 import io
 import json
-import logging
 import os
+import time, sys
 from typing import Any
 
 import google.auth
@@ -23,6 +23,8 @@ OUTPUT_TOPIC = os.getenv("OUTPUT_TOPIC", "receipts.text")
 
 PDF_TEXT_MIN_CHARS = int(os.getenv("PDF_TEXT_MIN_CHARS", "120"))
 VISION_PAGES_LIMIT = int(os.getenv("VISION_PAGES_LIMIT", "2"))  # OCR only first N pages for cost
+
+SEVERITIES = {"DEFAULT","DEBUG","INFO","NOTICE","WARNING","ERROR","CRITICAL","ALERT","EMERGENCY"}
 
 # ---------- Clients (reused across invocations) ----------
 # Auth with required scopes for Drive read
@@ -58,7 +60,7 @@ def _try_pdf_text_layer(pdf_bytes: bytes) -> str:
     try:
         return pdf_extract_text(io.BytesIO(pdf_bytes)) or ""
     except Exception as e:
-        logging.warning("pdfminer extraction failed: %s", e)
+        log("WARNING", f"pdfminer extraction failed: {e}")
         return ""
 
 def _vision_ocr_image(image_bytes: bytes) -> tuple[str, float, int]:
@@ -82,7 +84,6 @@ def _vision_ocr_image(image_bytes: bytes) -> tuple[str, float, int]:
                     conf_vals.append(b.confidence)
     confidence = (sum(conf_vals) / len(conf_vals)) if conf_vals else 0.0
     return text, confidence, max(1, pages)
-
 
 def _vision_ocr_pdf_via_gcs_async(file_id: str, pdf_bytes: bytes) -> tuple[str, float, int]:
     if not ARTIFACTS_BUCKET:
@@ -144,6 +145,20 @@ def _publish_output(msg: dict[str, Any]) -> None:
         engine=msg["ocr_meta"]["engine"]
     ).result()
 
+def log(severity="INFO", message="", **fields):
+    """Usage: log("SEVERITY-LEVEL", your-message)"""
+    sev = severity.upper() if severity else "DEFAULT"
+    if sev not in SEVERITIES:
+        sev = "DEFAULT"
+    record = {
+        "severity": sev, # <-- Cloud Logging parses this
+        "message": message, # human-readable
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **fields, # any extra structured fields you want
+    }
+    # Send errors+ to stderr, others to stdout (helps with some runtimes)
+    stream = sys.stderr if sev in {"ERROR","CRITICAL","ALERT","EMERGENCY"} else sys.stdout
+    print(json.dumps(record, ensure_ascii=False), file=stream, flush=True)
 
 # ---------- Entrypoint ----------
 def text_extraction(event, context):
@@ -162,7 +177,7 @@ def text_extraction(event, context):
     name = payload["name"]
     created_time = payload["createdTime"]
 
-    logging.info("Processing fileId=%s name=%s mime=%s", file_id, name, mime_type)
+    log("INFO", f"Processing fileId={file_id} name={name} mime={mime_type}")
 
     # 1) Download bytes + hash (for dedupe later)
     content = _download_drive_file_bytes(file_id)
@@ -193,7 +208,7 @@ def text_extraction(event, context):
             text, confidence, pages = _vision_ocr_image(content)
             engine = "vision_image"
     except Exception as e:
-        logging.exception("OCR failed for fileId=%s: %s", file_id, e)
+        log("ERROR", f"OCR failed for fileId={file_id}: {e}")
         # Publish a minimal message with empty text; downstream can route to review if desired
         text = ""
 
@@ -211,5 +226,4 @@ def text_extraction(event, context):
     }
 
     _publish_output(out)
-    logging.info("Published text for fileId=%s (%s, conf=%.3f, chars=%d)",
-                 file_id, engine, confidence, len(text))
+    log("INFO", f"Published text for fileId={file_id} ({engine}, conf={confidence:.3f}, chars={len(text)})")

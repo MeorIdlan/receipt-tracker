@@ -1,4 +1,4 @@
-import base64, json, logging, os, re, math
+import base64, json, os, re, math, time, sys
 from typing import Any
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -17,6 +17,7 @@ TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kuala_Lumpur"))
 CURRENCY_DEFAULT = os.getenv("CURRENCY_DEFAULT", "MYR").upper()
 EPSILON = float(os.getenv("TOTALS_EPSILON", "0.05"))  # allowed rounding diff
 DEDUPE_BUCKET = os.getenv("DEDUPE_BUCKET")  # optional: GCS bucket for atomic dedupe
+SEVERITIES = {"DEFAULT","DEBUG","INFO","NOTICE","WARNING","ERROR","CRITICAL","ALERT","EMERGENCY"}
 
 publisher = pubsub_v1.PublisherClient()
 storage_client = storage.Client() if DEDUPE_BUCKET else None
@@ -118,7 +119,7 @@ def _gcs_dedupe_mark(key: str) -> bool:
         # PreconditionFailed means it already exists
         if "PreconditionFailed" in str(e) or "412" in str(e):
             return False
-        logging.warning("Dedupe mark error for key=%s: %s", key, e)
+        log("WARNING", f"Dedupe mark error for key={key}: {e}")
         # fail-open so we don't drop data
         return True
 
@@ -225,6 +226,21 @@ def _normalize(data: dict[str, Any]) -> tuple[dict[str, Any], list[str], bool]:
     }
     return norm, notes, needs_review
 
+def log(severity="INFO", message="", **fields):
+    """Usage: log("SEVERITY-LEVEL", your-message)"""
+    sev = severity.upper() if severity else "DEFAULT"
+    if sev not in SEVERITIES:
+        sev = "DEFAULT"
+    record = {
+        "severity": sev, # <-- Cloud Logging parses this
+        "message": message, # human-readable
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **fields, # any extra structured fields you want
+    }
+    # Send errors+ to stderr, others to stdout (helps with some runtimes)
+    stream = sys.stderr if sev in {"ERROR","CRITICAL","ALERT","EMERGENCY"} else sys.stdout
+    print(json.dumps(record, ensure_ascii=False), file=stream, flush=True)
+
 # ---------- Entrypoint ----------
 def validator(event, context):
     """
@@ -247,7 +263,7 @@ def validator(event, context):
             "reason": "empty_or_invalid_llm_data",
             "image_hash": image_hash
         }, fileId=file_id or "")
-        logging.warning("validator: no data for fileId=%s", file_id)
+        log("WARNING", f"validator: no data for fileId={file_id}")
         return
 
     norm, notes, needs_review = _normalize(data)
@@ -262,7 +278,7 @@ def validator(event, context):
                 "dedupe_key": dedupe,
                 "norm": norm
             }, fileId=file_id or "", dedupe="hit")
-            logging.info("validator: duplicate %s fileId=%s", dedupe, file_id)
+            log("INFO", f"validator: duplicate {dedupe} fileId={file_id}")
             return
 
     # Prepare rows for Sheets

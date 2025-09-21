@@ -6,7 +6,7 @@ SA="$SA_NAME@$PROJECT_ID.iam.gserviceaccount.com"
 REGION="your-region"
 
 gcloud functions deploy validator \
-    --runtime=python313 --"$REGION" \
+    --runtime=python313 --region="$REGION" \
     --entry-point=validator \
     --trigger-topic=receipts.parsed \
     --service-account="$SA" \

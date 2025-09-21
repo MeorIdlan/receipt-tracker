@@ -1,7 +1,7 @@
 import base64
 import json
-import logging
 import os
+import sys, time
 from typing import Any
 
 from google.cloud import pubsub_v1
@@ -21,6 +21,7 @@ OUTPUT_TOPIC = os.getenv("OUTPUT_TOPIC", "receipts.parsed")
 MODEL = os.getenv("MODEL", "deepseek-chat")  # or deepseek-reasoner
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1000"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.1"))
+SEVERITIES = {"DEFAULT","DEBUG","INFO","NOTICE","WARNING","ERROR","CRITICAL","ALERT","EMERGENCY"}
 
 # DeepSeek API: use OpenAI SDK with base_url -> DeepSeek endpoint
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -67,7 +68,6 @@ Rules:
 - If uncertain about a field, set it to null (not 'N/A').
 """
 
-
 def _publish(msg: dict[str, Any]) -> None:
     data = json.dumps(msg).encode("utf-8")
     publisher.publish(
@@ -76,17 +76,30 @@ def _publish(msg: dict[str, Any]) -> None:
         fileId=msg.get("fileId", ""),
     ).result()
 
-
 def _to_json_or_none(s: str | None) -> dict[str, Any] | None:
-    logging.info(f"s: {s}")
+    log("INFO", f"String to be json-ed: {s}")
     try:
         if s:
             return json.loads(s)
         return None
     except Exception as e:
-        logging.warning(f"Error encountered during json.loads: {e}. Returning none")
+        log("WARNING", f"Error encountered during json.loads: {e}. Returning none")
         return None
-
+    
+def log(severity="INFO", message="", **fields):
+    """Usage: log("SEVERITY-LEVEL", your-message)"""
+    sev = severity.upper() if severity else "DEFAULT"
+    if sev not in SEVERITIES:
+        sev = "DEFAULT"
+    record = {
+        "severity": sev, # <-- Cloud Logging parses this
+        "message": message, # human-readable
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **fields, # any extra structured fields you want
+    }
+    # Send errors+ to stderr, others to stdout (helps with some runtimes)
+    stream = sys.stderr if sev in {"ERROR","CRITICAL","ALERT","EMERGENCY"} else sys.stdout
+    print(json.dumps(record, ensure_ascii=False), file=stream, flush=True)
 
 def deepseek_parser(event, context):
     """Pub/Sub trigger (topic: receipts.text) → DeepSeek JSON → receipts.parsed"""
@@ -100,7 +113,7 @@ def deepseek_parser(event, context):
     created_time = payload.get("createdTime")
     ocr_text = payload.get("text", "") or ""
 
-    logging.info("DeepSeek parse start fileId=%s chars=%d", file_id, len(ocr_text))
+    log("INFO", f"DeepSeek parse start fileId={file_id} chars={len(ocr_text)}")
 
     # If we have no OCR text, publish a 'null' data for downstream review
     if not ocr_text.strip():
@@ -110,7 +123,7 @@ def deepseek_parser(event, context):
             "data": None,
             "llm_meta": {"model": MODEL, "reason": "empty_ocr_text"},
         })
-        logging.warning("Empty OCR text for fileId=%s", file_id)
+        log("WARNING", f"Empty OCR text for fileId={file_id}")
         return
 
     # Build messages
@@ -156,7 +169,7 @@ def deepseek_parser(event, context):
 
         # If still bad, publish a null payload (validator can route to review)
         if not data or not isinstance(data, dict):
-            logging.error("DeepSeek returned non-JSON for fileId=%s", file_id)
+            log("ERROR", f"DeepSeek returned non-JSON for fileId={file_id}")
             _publish({
                 "fileId": file_id,
                 "image_hash": image_hash,
@@ -180,10 +193,10 @@ def deepseek_parser(event, context):
             },
         }
         _publish(out)
-        logging.info("DeepSeek parse ok fileId=%s", file_id)
+        log("INFO", f"DeepSeek parse ok fileId={file_id}")
 
     except Exception as e:
-        logging.exception("DeepSeek call failed for fileId=%s: %s", file_id, e)
+        log("ERROR", f"DeepSeek call failed for fileId={file_id}: {e}")
         _publish({
             "fileId": file_id,
             "image_hash": image_hash,

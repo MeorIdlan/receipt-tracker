@@ -1,7 +1,7 @@
 import base64
 import json
-import logging
 import os
+import time, sys
 from typing import Any
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -41,6 +41,8 @@ TOTALS_HEADER = [
 ]
 
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kuala_Lumpur"))
+
+SEVERITIES = {"DEFAULT","DEBUG","INFO","NOTICE","WARNING","ERROR","CRITICAL","ALERT","EMERGENCY"}
 
 # Auth with Sheets scope
 creds, _ = google.auth.default(scopes=[
@@ -302,7 +304,6 @@ def _ensure_totals_sheet(spreadsheet_id: str) -> int:
     sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": reqs}).execute()
     return sheet_id
 
-
 def _safe_float(x):
     try:
         return float(str(x).replace(",","").strip())
@@ -389,7 +390,6 @@ def _compute_month_metrics(spreadsheet_id: str, month_key: str) -> list:
         datetime.now(TZ).isoformat(timespec="seconds")
     ]
 
-
 def _upsert_month_total_row(spreadsheet_id: str, totals_sheet_id: int, metrics_row: list):
     """Insert or update the row in MONTHLY TOTAL where column A == month."""
     month_key = metrics_row[0]
@@ -423,12 +423,26 @@ def _upsert_month_total_row(spreadsheet_id: str, totals_sheet_id: int, metrics_r
             body={"values":[metrics_row]}
         ).execute()
 
-
 def _upsert_monthly_total(spreadsheet_id: str, month_key: str):
     """Public helper to ensure totals sheet + compute & upsert metrics for month_key."""
     totals_sheet_id = _ensure_totals_sheet(spreadsheet_id)
     metrics = _compute_month_metrics(spreadsheet_id, month_key)
     _upsert_month_total_row(spreadsheet_id, totals_sheet_id, metrics)
+    
+def log(severity="INFO", message="", **fields):
+    """Usage: log("SEVERITY-LEVEL", your-message)"""
+    sev = severity.upper() if severity else "DEFAULT"
+    if sev not in SEVERITIES:
+        sev = "DEFAULT"
+    record = {
+        "severity": sev, # <-- Cloud Logging parses this
+        "message": message, # human-readable
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **fields, # any extra structured fields you want
+    }
+    # Send errors+ to stderr, others to stdout (helps with some runtimes)
+    stream = sys.stderr if sev in {"ERROR","CRITICAL","ALERT","EMERGENCY"} else sys.stdout
+    print(json.dumps(record, ensure_ascii=False), file=stream, flush=True)
 
 # -------- Entrypoint --------
 def sheets_writer(event, context):
@@ -465,10 +479,10 @@ def sheets_writer(event, context):
         augmented.append(r + [status, notes_text, link_formula])
 
     if not augmented:
-        logging.warning("sheets_writer: no rows to append for month=%s fileId=%s", month_key, file_id)
+        log("WARNING", f"sheets_writer: no rows to append for month={month_key} fileId={file_id}")
         return
 
     _append_rows(SPREADSHEET_ID, month_key, augmented)
-    logging.info("sheets_writer: appended %d row(s) to %s (status=%s)", len(augmented), month_key, status)
+    log("INFO", f"sheets_writer: appended {len(augmented)} row(s) to {month_key} (status={status})")
     
     _upsert_monthly_total(SPREADSHEET_ID, month_key)
